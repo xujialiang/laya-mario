@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -84,135 +83,134 @@ def _run_realtime_dashboard(
     max_decisions: int,
     screenshot_path: Path | None,
 ) -> None:
+    """Realtime display loop built on the headless execution primitives.
+
+    Decisions are synchronous and each action window is executed by
+    ``step_decision_window`` — the same code path as ``--display none`` —
+    with a per-frame callback that draws the dashboard between emulator
+    frames. The picture simply freezes while Laya is thinking.
+    """
     actions = tuple(Action)
-    active_decision: Decision | None = None
-    pending: Future[Decision] | None = None
-    pending_snapshot: Any = None
-    pending_index = 0
-    pending_request_frame = 0
-    next_index = 0
-    frame_index = 0
-    last_request_frame = -frames_per_decision
     episode_reward = 0.0
-    reward_since_decision = 0.0
     previous_action: Action | None = None
     previous_reward = 0.0
     previous_latency_ms = 0.0
-    previous_response_delay_frames = 0
+    frames_since_parse = 0
     screenshot_saved = False
-    terminated = truncated = False
+    decision_index = 0
+    ended = False
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="laya") as executor:
-        while True:
-            decision_updated = False
-            snapshot = parser.parse(
-                info,
-                _unwrap_ram(env),
-                previous_action=previous_action.value if previous_action else None,
-                previous_reward=previous_reward,
-                previous_latency_ms=previous_latency_ms,
-                previous_response_delay_frames=previous_response_delay_frames,
-            )
+    while True:
+        snapshot = parser.parse(
+            info,
+            _unwrap_ram(env),
+            previous_action=previous_action.value if previous_action else None,
+            previous_reward=previous_reward,
+            previous_latency_ms=previous_latency_ms,
+            previous_response_delay_frames=0,
+            elapsed_frames=frames_since_parse,
+        )
+        if not ended and (snapshot.dead or snapshot.clear):
+            ended = True
 
-            if pending is not None and pending.done():
-                active_decision = pending.result()
-                _record_decision(
-                    log,
-                    decision_index=pending_index,
-                    snapshot=pending_snapshot,
-                    decision=active_decision,
-                    reward=reward_since_decision,
-                    terminated=terminated,
-                    truncated=truncated,
-                )
-                print(
-                    f"#{pending_index:04d} x={pending_snapshot.x:04d} "
-                    f"action={active_decision.action.value:<15} "
-                    f"confidence={active_decision.confidence:.2f} "
-                    f"latency={active_decision.latency_ms:.0f}ms"
-                )
-                pending = None
-                reward_since_decision = 0.0
-                decision_updated = True
-                previous_latency_ms = active_decision.latency_ms
-                previous_response_delay_frames = frame_index - pending_request_frame
-
-            run_ended = bool(
-                snapshot.dead
-                or snapshot.clear
-                or terminated
-                or truncated
-                or (next_index >= max_decisions and pending is None)
-            )
-
-            if (
-                not run_ended
-                and pending is None
-                and next_index < max_decisions
-                and frame_index - last_request_frame >= frames_per_decision
-            ):
-                pending_snapshot = snapshot
-                pending_index = next_index
-                pending = executor.submit(policy.choose, snapshot, actions)
-                pending_request_frame = frame_index
-                next_index += 1
-                last_request_frame = frame_index
-
-            if not run_ended:
-                action = active_decision.action if active_decision else Action.NOOP
-                if (
-                    decision_updated
-                    and action in JUMP_ACTIONS
-                    and (snapshot.grounded or active_decision.force_button_edge)
-                ):
-                    # A new jump macro needs a button-up edge before A is pressed again.
-                    # Grounded gate on purpose: releasing while falling makes Mario
-                    # bounce the instant he lands, which breaks the grounded
-                    # wait-and-takeoff rhythm at enemy packs. Stair hopping sets
-                    # force_button_edge to get a short capped hop every decision.
-                    action = JUMP_RELEASE_ACTION[action]
-                frame, reward, terminated, truncated, info = env.step(ACTION_TO_INDEX[action])
-                previous_action = action
-                previous_reward = float(reward)
-                reward_since_decision += float(reward)
-                episode_reward += float(reward)
-                frame_index += 1
-
+        if ended or decision_index >= max_decisions:
             command = dashboard.draw(
                 frame,
                 snapshot,
-                active_decision,
-                decision_index=max(0, next_index - 1),
+                None,
+                decision_index=decision_index,
                 episode_reward=episode_reward,
-                waiting=pending is not None,
-                run_ended=run_ended,
+                waiting=False,
+                run_ended=True,
             )
-            if screenshot_path is not None and active_decision is not None and not screenshot_saved:
-                dashboard.save(screenshot_path)
-                screenshot_saved = True
             if command == DashboardCommand.QUIT:
                 break
             if command == DashboardCommand.RESTART:
-                if pending is not None:
-                    pending.cancel()
                 frame, info = env.reset()
                 parser.reset()
-                active_decision = None
-                pending = None
-                pending_snapshot = None
-                pending_index = 0
-                pending_request_frame = 0
-                next_index = 0
-                frame_index = 0
-                last_request_frame = -frames_per_decision
-                episode_reward = 0.0
-                reward_since_decision = 0.0
                 previous_action = None
                 previous_reward = 0.0
                 previous_latency_ms = 0.0
-                previous_response_delay_frames = 0
-                terminated = truncated = False
+                frames_since_parse = 0
+                episode_reward = 0.0
+                decision_index = 0
+                ended = False
                 print("--- Restarted ---")
+            continue
+
+        decision = policy.choose(snapshot, actions)
+        display: dict[str, DashboardCommand] = {"command": DashboardCommand.CONTINUE}
+
+        def _on_frame(rendered: Any) -> None:
+            display["command"] = dashboard.draw(
+                rendered,
+                snapshot,
+                decision,
+                decision_index=decision_index,
+                episode_reward=episode_reward,
+                waiting=False,
+                run_ended=False,
+            )
+
+        (
+            frame,
+            info,
+            terminated,
+            truncated,
+            stepped,
+            _landed,
+            total_reward,
+        ) = step_decision_window(
+            env,
+            info,
+            action=decision.action,
+            force_edge=decision.force_button_edge,
+            previous_action=previous_action,
+            snapshot=snapshot,
+            frames_per_decision=frames_per_decision,
+            on_frame=_on_frame,
+        )
+        frames_since_parse = stepped
+
+        _record_decision(
+            log,
+            decision_index=decision_index,
+            snapshot=snapshot,
+            decision=decision,
+            reward=total_reward,
+            terminated=terminated,
+            truncated=truncated,
+        )
+        print(
+            f"#{decision_index:04d} x={snapshot.x:04d} "
+            f"action={decision.action.value:<15} "
+            f"confidence={decision.confidence:.2f} "
+            f"latency={decision.latency_ms:.0f}ms"
+        )
+        if screenshot_path is not None and not screenshot_saved:
+            dashboard.save(screenshot_path)
+            screenshot_saved = True
+
+        episode_reward += total_reward
+        previous_action = decision.action
+        previous_reward = total_reward
+        previous_latency_ms = decision.latency_ms
+        decision_index += 1
+        if terminated or truncated:
+            ended = True
+        if display["command"] == DashboardCommand.QUIT:
+            break
+        if display["command"] == DashboardCommand.RESTART:
+            frame, info = env.reset()
+            parser.reset()
+            previous_action = None
+            previous_reward = 0.0
+            previous_latency_ms = 0.0
+            frames_since_parse = 0
+            episode_reward = 0.0
+            decision_index = 0
+            ended = False
+            print("--- Restarted ---")
 
 
 def step_decision_window(
@@ -224,28 +222,38 @@ def step_decision_window(
     previous_action: Action | None,
     snapshot: Any,
     frames_per_decision: int,
-) -> tuple[Any, dict[str, Any], bool, bool, int, bool]:
+    on_frame: Any = None,
+) -> tuple[Any, dict[str, Any], bool, bool, int, bool, float]:
     """Step one decision window; the single source of macro execution semantics.
 
     Applies the jump button-up edge (forced, or when the previous macro held A and
     Mario is grounded) and the landing break (a window that started falling ends
-    at touchdown so the next decision happens on the ground). Returns
+    at touchdown so the next decision happens on the ground). ``on_frame``, when
+    given, is called with each rendered frame so the realtime dashboard can draw
+    between emulator steps without altering the window semantics. Returns
     (frame, info, terminated, truncated, stepped, landed_mid_window, reward).
     """
     stepped = 0
     total_reward = 0.0
     terminated = truncated = False
     frame = None
+
+    def _step(input_action: Action) -> tuple[Any, float, bool, bool, dict[str, Any]]:
+        step_frame, reward, step_terminated, step_truncated, step_info = env.step(
+            ACTION_TO_INDEX[input_action]
+        )
+        if on_frame is not None:
+            on_frame(step_frame)
+        return step_frame, float(reward), step_terminated, step_truncated, step_info
+
     if action in JUMP_ACTIONS and (
         force_edge or (previous_action in JUMP_ACTIONS and snapshot.grounded)
     ):
         # A fresh jump needs a button-up edge: Mario landing with A still held
         # from the previous macro cannot re-jump and runs into whatever he meant
         # to clear (measured at the 1-1 koopa).
-        frame, reward, terminated, truncated, info = env.step(
-            ACTION_TO_INDEX[JUMP_RELEASE_ACTION[action]]
-        )
-        total_reward += float(reward)
+        frame, reward, terminated, truncated, info = _step(JUMP_RELEASE_ACTION[action])
+        total_reward += reward
         stepped += 1
     # Landing into an enemy's face needs an immediate fresh decision: the blind
     # 8-frame window otherwise runs Mario into the goomba before he can jump
@@ -260,8 +268,8 @@ def step_decision_window(
     prev_y = info["y_pos"]
     landed = False
     while stepped < frames_per_decision and not (terminated or truncated):
-        frame, reward, terminated, truncated, info = env.step(ACTION_TO_INDEX[action])
-        total_reward += float(reward)
+        frame, reward, terminated, truncated, info = _step(action)
+        total_reward += reward
         stepped += 1
         if started_falling and info["y_pos"] >= prev_y:
             landed = True
