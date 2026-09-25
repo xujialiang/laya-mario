@@ -118,17 +118,72 @@ capped-hop chain for the two fixed 1-1 staircase sections.
 
 ## Fine-tuning and the finishing macro
 
-`scripts/finetune_noul.py` re-trains the noul head on rule-derived labels from
-run logs (`build`, `train`, `eval` subcommands; encoder hidden states are cached
-so head-only training takes minutes on CPU/MPS). Run the result with
-`--laya-checkpoint artifacts/laya-mario-noul`.
+The World 1-1 clear uses two artifacts on top of the stock Laya checkpoint:
+a **fine-tuned noul head** (`artifacts/laya-mario-noul`) and a **search-verified
+finishing macro** (`artifacts/finish-macro-1-1.json`). Neither ships with this
+repository; both are reproducible locally with the commands below.
+
+### Why the noul head is fine-tuned
+
+Every decision asks Laya three questions; the `choice` head picks the controller
+macro, but actually committing to a jump is gated by the calibrated probability
+of the `noul` head ("should Mario start or keep a forward jump now", commit at
+p ≥ 0.85). The stock checkpoint's noul calibration is not good enough for that
+gate: on logged decisive states it fires one window too early at enemy packs,
+drifts to 0.77-0.84 at pit takeoffs (below the commit threshold, measured twice
+at the 1-1 pit x≈1126), and wobbles mid-pack. The fine-tune exists to fix that
+one head.
+
+### What is trained
+
+`scripts/finetune_noul.py` trains **only the noul head** (encoder detached) on
+rule-derived labels from run logs — the labels are not imitation of logged
+actions, they are the verified mechanics:
+
+- grounded → jump when the parser's takeoff deadline fires, when a trusted gap
+  or wall is within 3 tiles, or when the nearest enemy is within 56 px
+  (measured: single goombas are cleared by a takeoff at 40-56 px; the koopa
+  jump at 109 px bonked the ? block; the quartet jump at 91 px landed mid-pack);
+- airborne → keep holding while crossing a committed gap, and while rising/at
+  apex with an enemy within 64 px (holding through the pack turns landings into
+  high stomp-bounces; releasing flattens the arc into the gaps between goombas);
+- everything else → don't jump.
+
+Training details that matter:
+
+- soft labels 0.99/0.01 instead of hard 0/1 — hard targets destroy calibration
+  on a small dataset, and YES states must sit decisively above the 0.85 commit
+  threshold after temperature scaling;
+- the 421M-parameter encoder runs exactly once per state and its hidden states
+  are cached, so head-only training takes minutes on CPU/MPS;
+- the noul temperature is re-fit on held-out data after training (the Agent
+  divides logits by it at inference; skipping the refit shifts every threshold);
+- validation is split by run, not by row, so the same run cannot leak into both
+  sides. The current dataset: 4490 train / 177 val states (2751 / 128 yes)
+  drawn from 48 logged runs.
+
+Reproduce:
+
+```bash
+.venv/bin/python scripts/finetune_noul.py build   # run logs -> rule-labeled dataset
+.venv/bin/python scripts/finetune_noul.py train   # dataset -> artifacts/laya-mario-noul
+.venv/bin/python scripts/finetune_noul.py eval    # A/B base vs fine-tuned on key states
+```
+
+`--multilingual` fine-tunes the mmBERT-base checkpoint instead (2x faster
+inference, `artifacts/laya-mario-noul-multilingual`); it trains but has not
+cleared World 1-1 — the verified clear uses the english fine-tune.
+
+### The finishing macro
 
 `scripts/beam_finish.py` drives the policy to the final gauntlet (x≈2080), then
 beam-searches decision windows against the live emulator (nes_py savestates) for
 a sequence that reaches the flagpole. The verified macro is written to
 `artifacts/finish-macro-1-1.json` and replayed with
 `--finish-macro artifacts/finish-macro-1-1.json`. With the fine-tuned checkpoint
-and the macro, World 1-1 completes (`flag_get=true` at x=3161).
+and the macro, World 1-1 completes (`flag_get=true` at x=3161); the recording in
+`docs/dashboard-1-1-clear.mp4` shows one such run, decision-for-decision
+identical to the headless clear.
 
 ## Development
 
